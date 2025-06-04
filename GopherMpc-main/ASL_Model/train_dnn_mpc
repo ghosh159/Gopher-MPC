@@ -1,0 +1,123 @@
+# Import necessary libraries
+import torch
+import torch.nn as nn
+import crypten
+import crypten.communicator as comm
+from crypten.mpc import MPCTensor
+from torch.utils.data import DataLoader
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Initialize CrypTen
+crypten.init()
+
+device = "cpu"
+
+# Define Neural Network class
+class NeuralNetwork(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.flatten = nn.Flatten()
+        self.linear_relu_stack = nn.Sequential(
+            nn.Linear(13, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU(),
+            nn.Linear(128, 24),
+        )
+
+    def forward(self, x):
+        x = self.flatten(x)
+        logits = self.linear_relu_stack(x)
+        return logits
+
+# Define dataset class
+class MediaPipePoseDataset(torch.utils.data.Dataset):
+    def __init__(self, csv_file):
+        self.positions = pd.read_csv(csv_file)
+
+    def __len__(self):
+        return len(self.positions)
+
+    def __getitem__(self, idx):
+        data = self.positions.iloc[idx, 1:].values.astype('float32')
+        character = self.positions.iloc[idx, 0]
+        character_int = ord(character) - ord('A')
+        return torch.tensor(data), character_int
+
+def vertical_partition(data, num_parties=3):
+    partition_size = data.shape[1] // num_parties
+    partitions = [data[:, i*partition_size:(i+1)*partition_size] for i in range(num_parties)]
+    return partitions
+
+def train_mpc(dataloader, model, loss_fn, optimizer, num_parties=3):
+    model.train()
+    for batch, (X, y) in enumerate(dataloader):
+        # Perform vertical partitioning
+        partitions = vertical_partition(X, num_parties)
+        X_enc = [MPCTensor(p, ptype=crypten.mpc.ptype.arithmetic) for p in partitions]
+        y_enc = MPCTensor(y, ptype=crypten.mpc.ptype.arithmetic)
+
+        # Forward pass
+        pred_enc = model(torch.cat(X_enc, dim=1))
+        loss_enc = loss_fn(pred_enc, y_enc.long())
+
+        # Backward pass
+        optimizer.zero_grad()
+        loss_enc.backward()
+        optimizer.step()
+
+        if batch % 100 == 0:
+            loss_val = loss_enc.get_plain_text().item()
+            print(f"loss: {loss_val:.6f}  [{batch * len(X):>5d}/{len(dataloader.dataset):>5d}]")
+
+def test_mpc(dataloader, model, loss_fn, num_parties=3):
+    model.eval()
+    test_loss, correct = 0, 0
+    with torch.no_grad():
+        for X, y in dataloader:
+            partitions = vertical_partition(X, num_parties)
+            X_enc = [MPCTensor(p, ptype=crypten.mpc.ptype.arithmetic) for p in partitions]
+            y_enc = MPCTensor(y, ptype=crypten.mpc.ptype.arithmetic)
+            pred_enc = model(torch.cat(X_enc, dim=1))
+            test_loss += loss_fn(pred_enc, y_enc.long()).get_plain_text().item()
+            correct += (pred_enc.get_plain_text().argmax(1) == y).sum().item()
+    size = len(dataloader.dataset)
+    avg_loss = test_loss / len(dataloader)
+    accuracy = correct / size
+    print(f"Test Error: \n Accuracy: {accuracy * 100:.1f}%, Avg loss: {avg_loss:.6f} \n")
+    return avg_loss, accuracy
+
+def main():
+    print(f"Using {device} device")
+
+    # Initialize the model
+    model = NeuralNetwork()
+    model_enc = crypten.nn.from_pytorch(model, torch.empty(1, 39))
+    model_enc.encrypt()
+
+    # Loss function and optimizer
+    loss_func = crypten.nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+
+    # Load datasets
+    batch_size = 8
+    training_dataset = MediaPipePoseDataset('Synthetic_Train_Features2.csv')
+    training_dataloader = DataLoader(training_dataset, batch_size=batch_size, shuffle=True)
+
+    testing_dataset = MediaPipePoseDataset('Synthetic_Test_Features2.csv')
+    testing_dataloader = DataLoader(testing_dataset, batch_size=batch_size, shuffle=False)
+
+    # Train and test
+    epochs = 20
+    for t in range(epochs):
+        print(f"Epoch {t+1}\n-------------------------------")
+        train_mpc(training_dataloader, model_enc, loss_func, optimizer)
+        test_loss, correct = test_mpc(testing_dataloader, model_enc, loss_func)
+    print("Training Complete!")
+
+if __name__ == "__main__":
+    main()
